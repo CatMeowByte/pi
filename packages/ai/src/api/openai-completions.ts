@@ -290,9 +290,36 @@ function isOpenAICompletionsReasoningField(field: string): field is OpenAIComple
 	return OPENAI_COMPLETIONS_REASONING_FIELDS.includes(field as OpenAICompletionsReasoningField);
 }
 
+/**
+ * Thinking signature for GitHub Copilot's `reasoning_opaque`: the reasoning field the text streamed in, and the
+ * opaque reasoning state to send back with that text. Absent `field` means the opaque value came without text.
+ */
+type OpaqueReasoningSignature = {
+	field?: OpenAICompletionsReasoningField;
+	reasoning_opaque: string;
+};
+
+function parseOpaqueReasoningSignature(signature: string | undefined): OpaqueReasoningSignature | undefined {
+	if (!signature) return undefined;
+	try {
+		// Signatures come from stored sessions, so the shape is checked here.
+		const parsed = JSON.parse(signature) as unknown;
+		if (!isReasoningDetailObject(parsed)) return undefined;
+		const { field, reasoning_opaque } = parsed;
+		return typeof reasoning_opaque === "string" &&
+			reasoning_opaque.length > 0 &&
+			(field === undefined || (typeof field === "string" && isOpenAICompletionsReasoningField(field)))
+			? { field, reasoning_opaque }
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 type ChatCompletionAssistantMessageParamWithReasoning = ChatCompletionAssistantMessageParam &
 	Partial<Record<OpenAICompletionsReasoningField, string>> & {
 		reasoning_details?: JsonValue[];
+		reasoning_opaque?: string;
 	};
 
 type ChatCompletionTextPartWithCacheControl = ChatCompletionContentPartText & {
@@ -340,12 +367,21 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			timestamp: Date.now(),
 		};
 
-		// `reasoning_details` are replay metadata, not user-visible stream deltas.
+		// `reasoning_details` and `reasoning_opaque` are replay metadata, not user-visible stream deltas.
 		// Keep them in memory during streaming and serialize once when the block is finalized.
 		let streamedReasoningDetails: OpenAIReasoningDetail[] | undefined;
-		const applyStreamedReasoningDetails = (block: ThinkingContent): void => {
+		let streamedReasoningField: OpenAICompletionsReasoningField | undefined;
+		// Copilot sends one opaque value per reasoning segment; like its VS Code client, the latest one is
+		// replayed with the concatenated reasoning text.
+		let streamedReasoningOpaque: string | undefined;
+		const applyStreamedReplayData = (block: ThinkingContent): void => {
 			if (streamedReasoningDetails !== undefined) {
 				block.thinkingSignature = JSON.stringify(streamedReasoningDetails);
+			} else if (streamedReasoningOpaque !== undefined) {
+				block.thinkingSignature = JSON.stringify({
+					field: streamedReasoningField,
+					reasoning_opaque: streamedReasoningOpaque,
+				} satisfies OpaqueReasoningSignature);
 			}
 		};
 
@@ -441,7 +477,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 						partial: output,
 					});
 				} else if (block.type === "thinking") {
-					applyStreamedReasoningDetails(block);
+					applyStreamedReplayData(block);
 					stream.push({
 						type: "thinking_end",
 						contentIndex,
@@ -596,9 +632,13 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 					// or reasoning (other openai compatible endpoints)
 					// Use the first non-empty reasoning field to avoid duplication
 					// (e.g., chutes.ai returns both reasoning_content and reasoning with same content)
-					const reasoningFields = ["reasoning_content", "reasoning", "reasoning_text"];
+					const reasoningFields = [
+						"reasoning_content",
+						"reasoning",
+						"reasoning_text",
+					] as const satisfies readonly OpenAICompletionsReasoningField[];
 					const deltaFields = choice.delta as Record<string, unknown>;
-					let foundReasoningField: string | null = null;
+					let foundReasoningField: OpenAICompletionsReasoningField | null = null;
 					for (const field of reasoningFields) {
 						const value = deltaFields[field];
 						if (typeof value === "string" && value.length > 0) {
@@ -614,6 +654,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 								model.provider === "opencode-go" && foundReasoningField === "reasoning"
 									? "reasoning_content"
 									: foundReasoningField;
+							streamedReasoningField = thinkingSignature;
 							const block = ensureThinkingBlock(thinkingSignature);
 							block.thinking += delta;
 							stream.push({
@@ -623,6 +664,12 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 								partial: output,
 							});
 						}
+					}
+
+					const reasoningOpaque = deltaFields.reasoning_opaque;
+					if (typeof reasoningOpaque === "string" && reasoningOpaque.length > 0) {
+						ensureThinkingBlock("");
+						streamedReasoningOpaque = reasoningOpaque;
 					}
 
 					const reasoningDetails = (choice.delta as { reasoning_details?: unknown }).reasoning_details;
@@ -711,7 +758,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 		} catch (error) {
 			for (const block of output.content) {
 				if (block.type === "thinking") {
-					applyStreamedReasoningDetails(block);
+					applyStreamedReplayData(block);
 				}
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
@@ -1327,6 +1374,11 @@ export function convertMessages(
 				.filter((detail): detail is OpenAIEncryptedReasoningDetail => detail !== undefined);
 			const preservedReasoningDetails =
 				signedReasoningDetails ?? (legacyReasoningDetails.length > 0 ? legacyReasoningDetails : undefined);
+			const opaqueReasoning = preservedReasoningDetails
+				? undefined
+				: thinkingBlocks
+						.map((block) => parseOpaqueReasoningSignature(block.thinkingSignature))
+						.findLast((signature) => signature !== undefined);
 
 			const nonEmptyThinkingBlocks = thinkingBlocks.filter((block) => block.thinking.trim().length > 0);
 			if (nonEmptyThinkingBlocks.length > 0) {
@@ -1349,7 +1401,7 @@ export function convertMessages(
 					// reasoning_details is the structured alternative to a raw reasoning field.
 					if (!preservedReasoningDetails) {
 						// Use the signature from the first thinking block if available (for llama.cpp server + gpt-oss)
-						let signature = nonEmptyThinkingBlocks[0].thinkingSignature;
+						let signature = opaqueReasoning ? opaqueReasoning.field : nonEmptyThinkingBlocks[0].thinkingSignature;
 						if (model.provider === "opencode-go" && signature === "reasoning") {
 							signature = "reasoning_content";
 						}
@@ -1392,6 +1444,9 @@ export function convertMessages(
 			}
 			if (preservedReasoningDetails) {
 				assistantMsg.reasoning_details = preservedReasoningDetails;
+			}
+			if (opaqueReasoning) {
+				assistantMsg.reasoning_opaque = opaqueReasoning.reasoning_opaque;
 			}
 			if (
 				compat.requiresReasoningContentOnAssistantMessages &&
